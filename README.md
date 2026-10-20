@@ -1,129 +1,85 @@
-<h1>🚀 Databricks CDC Star Schema Engine</h1>
+# Databricks CDC Star Schema Engine
 
-<p>
-A <strong>config-driven data pipeline engine</strong> built on Databricks and Apache Spark for generating 
-<strong>incremental fact tables</strong> using <strong>CDC (Change Data Capture)</strong> and dynamically joining 
-dimension tables to produce a <strong>star schema</strong>.
-</p>
+A config-driven data pipeline built on Databricks and Apache Spark that ingests flight-booking CSV files incrementally, cleans them with a Delta Live Tables (Lakeflow Declarative Pipelines) silver layer that applies CDC, and builds a gold star schema (dimension tables with surrogate keys plus an incremental fact table). The gold notebooks are parameterised so the same logic can be reused for different dimension and fact tables by changing configuration rather than code.
 
-<hr>
+## Architecture
 
-<h2>📌 Overview</h2>
+```
+CSV files in a Unity Catalog volume (raw)
+        │  Auto Loader (cloudFiles), availableNow trigger
+        ▼
+Bronze: Delta files per source (bookings, flights, customers, airports)
+        │  DLT pipeline: expectations, type casting, AUTO CDC (SCD Type 1)
+        ▼
+Silver: silver_bookings, silver_flight, silver_passengers, silver_airports
+        │  Config-driven notebooks: surrogate keys + Delta MERGE upserts
+        ▼
+Gold:   dimpassengers, dimflights, dimairports  →  factbookings
+```
 
-<p>This project implements a reusable framework to:</p>
+`SrcParameters.py` publishes the list of sources as a job task value (`output_key`), which suggests the bronze notebook is run once per source from a Databricks Job (for example a For Each task).
 
-<ul>
-    <li>Build <strong>incremental fact tables</strong> from source data</li>
-    <li>Dynamically join multiple <strong>dimension tables</strong></li>
-    <li>Support <strong>CDC-based processing</strong> using timestamp columns</li>
-    <li>Generate queries programmatically using configuration</li>
-    <li>Enable scalable <strong>medallion architecture (Bronze → Silver → Gold)</strong></li>
-</ul>
+## Tech stack
 
-<p>
-The engine abstracts business logic into configuration, allowing flexible and reusable pipeline design across datasets.
-</p>
+- Databricks (notebooks, Jobs task values, Unity Catalog volumes)
+- Apache Spark / PySpark and Spark SQL
+- Auto Loader (`cloudFiles`) with schema evolution in `rescue` mode
+- Delta Lake (`DeltaTable.merge`)
+- Delta Live Tables / Lakeflow Declarative Pipelines (`dlt`, expectations, `create_auto_cdc_flow`)
 
-<hr>
+## Repository structure
 
-<h2>⚙️ Key Features</h2>
+```
+.
+├── Setup.py                  # Creates the raw volume and source folders
+├── SrcParameters.py          # List of sources, published as a job task value
+├── BronzeLayer.py            # Auto Loader ingestion of one source (widget "src")
+├── DLT_Bookings/             # DLT pipeline source
+│   ├── transformations/DLTPipeline_silver.py  # Silver tables and CDC flows
+│   ├── explorations/sample_exploration.py     # Ad-hoc exploration (not part of the pipeline)
+│   └── utilities/utils.py                     # Email-validation UDF (template utility)
+├── Gold/
+│   ├── GOLD_DIMS.py          # Generic SCD Type 1 dimension builder
+│   └── GOLD_FACT.py          # Incremental fact builder with dynamic dimension joins
+└── Data/                     # Sample CSVs: initial, *_increment and *_scd files
+```
 
-<ul>
-    <li>
-        <strong>CDC-Based Incremental Loads</strong><br>
-        Processes only new or updated records using a configurable timestamp column.
-    </li>
-    <br>
-    <li>
-        <strong>Dynamic Star Schema Generation</strong><br>
-        Automatically builds joins between fact and dimension tables using metadata-driven configuration.
-    </li>
-    <br>
-    <li>
-        <strong>Config-Driven Architecture</strong><br>
-        All joins, columns, and mappings are defined in configuration — no hardcoding.
-    </li>
-    <br>
-    <li>
-        <strong>Delta Lake Integration</strong><br>
-        Designed for seamless use with Delta tables, supporting scalable data warehousing patterns.
-    </li>
-    <br>
-    <li>
-        <strong>Reusable Query Engine</strong><br>
-        SQL queries are generated dynamically, making the pipeline adaptable to multiple use cases.
-    </li>
-</ul>
+## What each stage does
 
-<hr>
+**Setup (`Setup.py`)** – creates the `workspace.raw.volume` volume and a raw folder per source, and contains a quick check query against the bronze flights data.
 
-<h2>🧠 How It Works</h2>
+**Bronze (`BronzeLayer.py`)** – reads the `src` widget, streams CSV files from `/Volumes/workspace/raw/volume/rawdata/<src>/` with Auto Loader and appends them as Delta to `/Volumes/workspace/bronze/bronzevolume/<src>/data` using a checkpoint and an `availableNow` trigger, so each run only picks up new files.
 
-<ol>
-    <li>
-        <strong>Determine Last Load Timestamp</strong>
-        <ul>
-            <li>Fetches the latest processed timestamp from the target table</li>
-            <li>Falls back to a default value for initial loads</li>
-        </ul>
-    </li>
-    <br>
-    <li>
-        <strong>Generate Dynamic SQL</strong>
-        <ul>
-            <li>Selects required fact columns</li>
-            <li>Joins dimension tables based on configured keys</li>
-            <li>Adds surrogate keys from dimension tables</li>
-            <li>Applies incremental filtering using CDC column</li>
-        </ul>
-    </li>
-    <br>
-    <li>
-        <strong>Execute Transformation</strong>
-        <ul>
-            <li>Runs the generated SQL using Spark</li>
-            <li>Produces a ready-to-load fact dataset</li>
-        </ul>
-    </li>
-</ol>
+**Silver (`DLT_Bookings/transformations/DLTPipeline_silver.py`)**
+- Bookings: drops rows where `booking_id` or `passenger_id` is null (`expect_all_or_drop`), casts `amount` to `decimal(18,2)` and `booking_date` to date, adds `modifiedDate`, and writes `silver_bookings`.
+- Flights, passengers (from the `customers` source) and airports: drop `_rescued_data`, add `modifiedDate`, and upsert into streaming tables with `create_auto_cdc_flow` keyed on `flight_id`, `passenger_id` and `airport_id`, sequenced by `modifiedDate`, stored as SCD Type 1.
 
-<hr>
+**Gold dimensions (`Gold/GOLD_DIMS.py`)** – configured with catalog, source/target table, key columns, CDC column, surrogate key name and an optional backdated refresh date. It:
+1. Finds the last load timestamp from the target (or `1900-01-01` on first load).
+2. Reads source rows changed since then and left-joins them to the existing target on the business keys.
+3. Keeps existing surrogate keys for matched rows (setting `update_date`) and generates new keys for new rows (`max key + monotonically_increasing_id() + 1`, with `create_date`/`update_date`).
+4. Upserts with a Delta MERGE on the surrogate key, or creates the table on first run.
 
-<h2>🔄 Incremental Processing Logic</h2>
+The notebook contains ready-made configuration blocks for `DimPassengers` and `DimAirports` (commented out) and an active block for `dimflights`.
 
-<p>The engine ensures efficient processing by filtering only new data:</p>
+**Gold fact (`Gold/GOLD_FACT.py`)** – reads `silver_bookings`, and from a list of dimension configs (table, alias, join keys, surrogate key) generates a SQL query that left-joins each dimension, selects `amount`, `booking_date`, `modifiedDate` and the three surrogate keys, and filters on `modifiedDate > last_load`. The result is merged into `workspace.gold.factbookings` on the surrogate key columns.
 
-<pre>
-<code>
-fact.modifiedDate &gt; last_processed_timestamp
-</code>
-</pre>
+## Sample data
 
-<p>This avoids:</p>
+`Data/` holds CSV files for bookings, flights, passengers and airports. Each entity has an initial file, plus `*_increment.csv` (new records) and, for dimensions, `*_scd.csv` (changed records) that can be dropped into the raw volume to exercise incremental loads and CDC updates.
 
-<ul>
-    <li>Reprocessing historical data</li>
-    <li>Duplicate loads</li>
-    <li>Performance bottlenecks</li>
-</ul>
+## How to run
 
-<hr>
+Prerequisites: a Databricks workspace with Unity Catalog, a catalog named `workspace` with `raw`, `bronze`, `silver` and `gold` schemas, and the `workspace.bronze.bronzevolume` volume (the notebooks use these names directly).
 
-<h2>🧩 Configuration-Driven Design</h2>
+1. Run `Setup.py` and upload the CSV files from `Data/` into `/Volumes/workspace/raw/volume/rawdata/<source>/` (`bookings`, `flights`, `customers`, `airports`).
+2. Run `BronzeLayer.py` for each source, either manually with the `src` widget or from a job that iterates over the task value set by `SrcParameters.py`.
+3. Create a DLT / Lakeflow pipeline from `DLT_Bookings/` targeting the `silver` schema and run it.
+4. Run `Gold/GOLD_DIMS.py` once per dimension (switching the active configuration block), then `Gold/GOLD_FACT.py`.
+5. To test incremental behaviour, upload the `*_increment.csv` and `*_scd.csv` files and re-run the steps.
 
-<p>All transformations are controlled via configuration, including:</p>
+## Possible improvements
 
-<ul>
-    <li>Fact table source</li>
-    <li>Dimension tables and join keys</li>
-    <li>Surrogate keys</li>
-    <li>Columns to select</li>
-</ul>
-
-<p>This allows:</p>
-
-<ul>
-    <li>Rapid onboarding of new pipelines</li>
-    <li>Minimal code changes</li>
-    <li>High reusability</li>
-</ul>
+- Pass the gold configuration as widgets or job parameters instead of editing commented blocks, and replace `eval()` on the key lists with a safer parser.
+- `GOLD_DIMS.py` uses `DeltaTable` without importing `delta.tables`; adding the import makes the notebook self-contained.
+- New surrogate keys are cast to string while existing keys keep their original type; keeping one numeric type avoids mismatches.
